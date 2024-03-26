@@ -1,586 +1,357 @@
-import logging
-import math
+# paper: https://aclanthology.org/2021.emnlp-main.552/
+# reference implementation: https://github.com/princeton-nlp/SimCSE
+#
+# this implementation only supports Unsup-SimCSE.
+# if you want to run the training of Sup-SimCSE, please modify this code yourself.
+
+import json
 import os
-import sys
-from dataclasses import dataclass, field
-from typing import Optional, Union, List, Dict, Tuple
-import torch
-import collections
 import random
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, List, Union
 
-from datasets import load_dataset
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from classopt import classopt
+from more_itertools import chunked
+from torch import Tensor
+from torch.utils.data import DataLoader, Dataset
+from tqdm import tqdm
+from transformers import AutoModel, AutoTokenizer, logging
+from transformers.modeling_outputs import BaseModelOutputWithPoolingAndCrossAttentions
+from transformers.modeling_utils import PreTrainedModel
+from transformers.optimization import get_linear_schedule_with_warmup
+from transformers.tokenization_utils import BatchEncoding, PreTrainedTokenizer
 
-import transformers
-from transformers import (
-    CONFIG_MAPPING,
-    MODEL_FOR_MASKED_LM_MAPPING,
-    AutoConfig,
-    AutoModelForMaskedLM,
-    AutoModelForSequenceClassification,
-    AutoTokenizer,
-    DataCollatorForLanguageModeling,
-    DataCollatorWithPadding,
-    HfArgumentParser,
-    Trainer,
-    TrainingArguments,
-    default_data_collator,
-    set_seed,
-    EvalPrediction,
-    BertModel,
-    BertForPreTraining,
-    RobertaModel
-)
-from transformers.tokenization_utils_base import BatchEncoding, PaddingStrategy, PreTrainedTokenizerBase
-from transformers.trainer_utils import is_main_process
-from transformers.data.data_collator import DataCollatorForLanguageModeling
-from transformers.file_utils import cached_property, torch_required, is_torch_available, is_torch_tpu_available
-from simcse.models import RobertaForCL, BertForCL
-from simcse.trainers import CLTrainer
+from sts import STSEvaluation
 
-logger = logging.getLogger(__name__)
-MODEL_CONFIG_CLASSES = list(MODEL_FOR_MASKED_LM_MAPPING.keys())
-MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
+
+# classopt is a library for parsing command line arguments in a dataclass style.
+# different from argparse, classopt can enjoy the benefits of type hints.
+# see: https://github.com/moisutsu/classopt (let's star it!)
+@classopt(default_long=True)
+class Args:
+    model_name: str = "bert-base-uncased"
+    # any data set in line-by-line text format can be used.
+    # however, it is worth noting that diversity of the dataset is important for SimCSE.
+    # see: https://github.com/princeton-nlp/SimCSE/issues/62
+    dataset_dir: Path = "./datasets/unsup-simcse"
+    sts_dir: Path = "./datasets/sts"
+    output_dir: Path = "./outputs"
+
+    # for more detailed hyperparameter settings, see Appendix.A of the paper
+    # FYI: SimCSE is not sensitive to batch sizes and learning rates
+    batch_size: int = 64
+    # the number of epochs is 1 for Unsup-SimCSE, and 3 for Sup-SimCSE in the paper
+    epochs: int = 1
+    lr: float = 3e-5
+    # num_warmup_steps is 0 by default (i.e. no warmup)
+    num_warmup_steps: int = 0
+
+    # see Table D.1 of the paper
+    temperature: float = 0.05
+
+    # FYI: max_seq_len of reference implementation is 32
+    # it seems short, but it is enough for the STS task
+    # you should be careful when you apply SimCSE to other tasks that require longer sequences to be handled properly.
+    # for other hyperparameters, see Appendix.A of the paper.
+    max_seq_len: int = 32
+
+    # FYI: the paper says that the evaluation interval is 250 steps.
+    # however, the example training script of official implementation uses 125 steps.
+    # this does not seem to be a problem when the number of training steps is large (i.e. batch size is small), as in BERT (batch_size=64),
+    # but it may make some difference when the number of steps is small (i.e. batch size is large), as in RoBERTa (batch_size=512).
+    # see: https://github.com/princeton-nlp/SimCSE/blob/511c99d4679439c582beb86a0372c04865610b6b/run_unsup_example.sh
+    eval_logging_interval: int = 250
+
+    # if you want to use `fp16`, you may encounter some issues.
+    # see: https://github.com/princeton-nlp/SimCSE/issues/38#issuecomment-855457923
+    device: str = "cuda:0"
+
+    # due to various influences such as implementation and hardware, the same random seed does not always produce the same results.
+    # the hyperparameters used in the paper are tuned with a single random seed,
+    # so the results may be slightly different from the paper.
+    # if you train your own model, you should preferably re-tune the hyperparameters.
+    # FYI: https://github.com/princeton-nlp/SimCSE/issues/63
+    seed: int = 42
+
+
+# Reading text line by line is a very simple processing, so we don't need to use a Dataset class actually.
+# However we define a dedicated class for future extensibility.
 @dataclass
-class ModelArguments:
-    """
-    Arguments pertaining to which model/config/tokenizer we are going to fine-tune, or train from scratch.
-    """
+class SimCSEDataset(Dataset):
+    path: Path
+    data: List[str] = None
 
-    # Huggingface's original arguments
-    model_name_or_path: Optional[str] = field(
-        default=None,
-        metadata={
-            "help": "The model checkpoint for weights initialization."
-            "Don't set if you want to train a model from scratch."
-        },
-    )
-    model_type: Optional[str] = field(
-        default=None,
-        metadata={"help": "If training from scratch, pass a model type from the list: " + ", ".join(MODEL_TYPES)},
-    )
-    config_name: Optional[str] = field(
-        default=None, metadata={"help": "Pretrained config name or path if not the same as model_name"}
-    )
-    tokenizer_name: Optional[str] = field(
-        default=None, metadata={"help": "Pretrained tokenizer name or path if not the same as model_name"}
-    )
-    cache_dir: Optional[str] = field(
-        default=None,
-        metadata={"help": "Where do you want to store the pretrained models downloaded from huggingface.co"},
-    )
-    use_fast_tokenizer: bool = field(
-        default=True,
-        metadata={"help": "Whether to use one of the fast tokenizer (backed by the tokenizers library) or not."},
-    )
-    model_revision: str = field(
-        default="main",
-        metadata={"help": "The specific model version to use (can be a branch name, tag name or commit id)."},
-    )
-    use_auth_token: bool = field(
-        default=False,
-        metadata={
-            "help": "Will use the token generated when running `transformers-cli login` (necessary to use this script "
-            "with private models)."
-        },
-    )
-
-    # SimCSE's arguments
-    temp: float = field(
-        default=0.05,
-        metadata={
-            "help": "Temperature for softmax."
-        }
-    )
-    pooler_type: str = field(
-        default="cls",
-        metadata={
-            "help": "What kind of pooler to use (cls, cls_before_pooler, avg, avg_top2, avg_first_last)."
-        }
-    ) 
-    hard_negative_weight: float = field(
-        default=0,
-        metadata={
-            "help": "The **logit** of weight for hard negatives (only effective if hard negatives are used)."
-        }
-    )
-    do_mlm: bool = field(
-        default=False,
-        metadata={
-            "help": "Whether to use MLM auxiliary objective."
-        }
-    )
-    mlm_weight: float = field(
-        default=0.1,
-        metadata={
-            "help": "Weight for MLM auxiliary objective (only effective if --do_mlm)."
-        }
-    )
-    mlp_only_train: bool = field(
-        default=False,
-        metadata={
-            "help": "Use MLP only during training"
-        }
-    )
-
-
-@dataclass
-class DataTrainingArguments:
-    """
-    Arguments pertaining to what data we are going to input our model for training and eval.
-    """
-
-    # Huggingface's original arguments. 
-    dataset_name: Optional[str] = field(
-        default=None, metadata={"help": "The name of the dataset to use (via the datasets library)."}
-    )
-    dataset_config_name: Optional[str] = field(
-        default=None, metadata={"help": "The configuration name of the dataset to use (via the datasets library)."}
-    )
-    overwrite_cache: bool = field(
-        default=False, metadata={"help": "Overwrite the cached training and evaluation sets"}
-    )
-    validation_split_percentage: Optional[int] = field(
-        default=5,
-        metadata={
-            "help": "The percentage of the train set used as validation set in case there's no validation split"
-        },
-    )
-    preprocessing_num_workers: Optional[int] = field(
-        default=None,
-        metadata={"help": "The number of processes to use for the preprocessing."},
-    )
-
-    # SimCSE's arguments
-    train_file: Optional[str] = field(
-        default=None, 
-        metadata={"help": "The training data file (.txt or .csv)."}
-    )
-    max_seq_length: Optional[int] = field(
-        default=32,
-        metadata={
-            "help": "The maximum total input sequence length after tokenization. Sequences longer "
-            "than this will be truncated."
-        },
-    )
-    pad_to_max_length: bool = field(
-        default=False,
-        metadata={
-            "help": "Whether to pad all samples to `max_seq_length`. "
-            "If False, will pad the samples dynamically when batching to the maximum length in the batch."
-        },
-    )
-    mlm_probability: float = field(
-        default=0.15, 
-        metadata={"help": "Ratio of tokens to mask for MLM (only effective if --do_mlm)"}
-    )
-
+    # For simplicity, this dataset class is designed to tokenize text for each loop,
+    # but if performance is more important, you should tokenize all text in advance.
     def __post_init__(self):
-        if self.dataset_name is None and self.train_file is None and self.validation_file is None:
-            raise ValueError("Need either a dataset name or a training/validation file.")
-        else:
-            if self.train_file is not None:
-                extension = self.train_file.split(".")[-1]
-                assert extension in ["csv", "json", "txt"], "`train_file` should be a csv, a json or a txt file."
+        self.data = []
+        with self.path.open() as f:
+            # to prevent whole text into memory at once
+            for line in f:
+                line = line.strip()
+                if line:
+                    self.data.append(line)
+
+    def __getitem__(self, index: int) -> Tensor:
+        return self.data[index]
+
+    def __len__(self) -> int:
+        return len(self.data)
 
 
-@dataclass
-class OurTrainingArguments(TrainingArguments):
-    # Evaluation
-    ## By default, we evaluate STS (dev) during training (for selecting best checkpoints) and evaluate 
-    ## both STS and transfer tasks (dev) at the end of training. Using --eval_transfer will allow evaluating
-    ## both STS and transfer tasks (dev) during training.
-    eval_transfer: bool = field(
-        default=False,
-        metadata={"help": "Evaluate transfer task dev sets (in validation)."}
-    )
+class SimCSEModel(nn.Module):
+    def __init__(self, model_name: str):
+        super().__init__()
+        # you can use any models
+        self.backbone: PreTrainedModel = AutoModel.from_pretrained(model_name)
 
-    @cached_property
-    @torch_required
-    def _setup_devices(self) -> "torch.device":
-        logger.info("PyTorch: setting up devices")
-        if self.no_cuda:
-            device = torch.device("cpu")
-            self._n_gpu = 0
-        elif is_torch_tpu_available():
-            import torch_xla.core.xla_model as xm
-            device = xm.xla_device()
-            self._n_gpu = 0
-        elif self.local_rank == -1:
-            # if n_gpu is > 1 we'll use nn.DataParallel.
-            # If you only want to use a specific subset of GPUs use `CUDA_VISIBLE_DEVICES=0`
-            # Explicitly set CUDA to the first (index 0) CUDA device, otherwise `set_device` will
-            # trigger an error that a device index is missing. Index 0 takes into account the
-            # GPUs available in the environment, so `CUDA_VISIBLE_DEVICES=1,2` with `cuda:0`
-            # will use the first GPU in that env, i.e. GPU#1
-            device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-            # Sometimes the line in the postinit has not been run before we end up here, so just checking we're not at
-            # the default value.
-            self._n_gpu = torch.cuda.device_count()
-        else:
-            # Here, we'll use torch.distributed.
-            # Initializes the distributed backend which will take care of synchronizing nodes/GPUs
-            #
-            # deepspeed performs its own DDP internally, and requires the program to be started with:
-            # deepspeed  ./program.py
-            # rather than:
-            # python -m torch.distributed.launch --nproc_per_node=2 ./program.py
-            if self.deepspeed:
-                from .integrations import is_deepspeed_available
+        # define additional MLP layer
+        # see Section 6.3 of the paper for more details
+        # refenrece: https://github.com/princeton-nlp/SimCSE/blob/511c99d4679439c582beb86a0372c04865610b6b/simcse/models.py#L19
+        self.hidden_size: int = self.backbone.config.hidden_size
+        self.dense = nn.Linear(self.hidden_size, self.hidden_size)
+        self.activation = nn.Tanh()
 
-                if not is_deepspeed_available():
-                    raise ImportError("--deepspeed requires deepspeed: `pip install deepspeed`.")
-                import deepspeed
-
-                deepspeed.init_distributed()
-            else:
-                torch.distributed.init_process_group(backend="nccl")
-            device = torch.device("cuda", self.local_rank)
-            self._n_gpu = 1
-
-        if device.type == "cuda":
-            torch.cuda.set_device(device)
-
-        return device
-
-
-def main():
-    # See all possible arguments in src/transformers/training_args.py
-    # or by passing the --help flag to this script.
-    # We now keep distinct sets of args, for a cleaner separation of concerns.
-
-    parser = HfArgumentParser((ModelArguments, DataTrainingArguments, OurTrainingArguments))
-    if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
-        # If we pass only one argument to the script and it's the path to a json file,
-        # let's parse it to get our arguments.
-        model_args, data_args, training_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
-    else:
-        model_args, data_args, training_args = parser.parse_args_into_dataclasses()
-
-    if (
-        os.path.exists(training_args.output_dir)
-        and os.listdir(training_args.output_dir)
-        and training_args.do_train
-        and not training_args.overwrite_output_dir
-    ):
-        raise ValueError(
-            f"Output directory ({training_args.output_dir}) already exists and is not empty."
-            "Use --overwrite_output_dir to overcome."
+    def forward(
+        self,
+        input_ids: Tensor,
+        attention_mask: Tensor = None,
+        # RoBERTa variants don't have token_type_ids, so this argument is optional
+        token_type_ids: Tensor = None,
+    ) -> Tensor:
+        # shape of input_ids: (batch_size, seq_len)
+        # shape of attention_mask: (batch_size, seq_len)
+        outputs: BaseModelOutputWithPoolingAndCrossAttentions = self.backbone(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
         )
 
-    # Setup logging
-    logging.basicConfig(
-        format="%(asctime)s - %(levelname)s - %(name)s -   %(message)s",
-        datefmt="%m/%d/%Y %H:%M:%S",
-        level=logging.INFO if is_main_process(training_args.local_rank) else logging.WARN,
-    )
+        # take representations of [CLS] token
+        # we only implement the best performing pooling, [CLS], for simplicity
+        # you can easily extend to other poolings (such as mean pooling or max pooling) by edting this line
+        # shape of last_hidden_state: (batch_size, seq_len, hidden_size)
+        emb = outputs.last_hidden_state[:, 0]
 
-    # Log on each process the small summary:
-    logger.warning(
-        f"Process rank: {training_args.local_rank}, device: {training_args.device}, n_gpu: {training_args.n_gpu}"
-        + f" distributed training: {bool(training_args.local_rank != -1)}, 16-bits training: {training_args.fp16}"
-    )
-    # Set the verbosity to info of the Transformers logger (on main process only):
-    if is_main_process(training_args.local_rank):
-        transformers.utils.logging.set_verbosity_info()
-        transformers.utils.logging.enable_default_handler()
-        transformers.utils.logging.enable_explicit_format()
-    logger.info("Training/evaluation parameters %s", training_args)
+        # original SimCSE uses MLP layer only during training
+        # see: Table 6 of the paper
+        # this trick is a bit complicated, so you may omit it when training your own model
+        if self.training:
+            emb = self.dense(emb)
+            emb = self.activation(emb)
+        # shape of emb: (batch_size, hidden_size)
+        return emb
 
-    # Set seed before initializing model.
-    set_seed(training_args.seed)
 
-    # Get the datasets: you can either provide your own CSV/JSON/TXT training and evaluation files (see below)
-    # or just provide the name of one of the public datasets available on the hub at https://huggingface.co/datasets/
-    # (the dataset will be downloaded automatically from the datasets Hub
-    #
-    # For CSV/JSON files, this script will use the column called 'text' or the first column. You can easily tweak this
-    # behavior (see below)
-    #
-    # In distributed training, the load_dataset function guarantee that only one local process can concurrently
-    # download the dataset.
-    data_files = {}
-    if data_args.train_file is not None:
-        data_files["train"] = data_args.train_file
-    extension = data_args.train_file.split(".")[-1]
-    if extension == "txt":
-        extension = "text"
-    if extension == "csv":
-        datasets = load_dataset(extension, data_files=data_files, cache_dir="./data/", delimiter="\t" if "tsv" in data_args.train_file else ",")
-    else:
-        datasets = load_dataset(extension, data_files=data_files, cache_dir="./data/")
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
-    # See more about loading any type of standard or custom dataset (from files, python dict, pandas DataFrame, etc) at
-    # https://huggingface.co/docs/datasets/loading_datasets.html.
 
-    # Load pretrained model and tokenizer
-    #
-    # Distributed training:
-    # The .from_pretrained methods guarantee that only one local process can concurrently
-    # download model & vocab.
-    config_kwargs = {
-        "cache_dir": model_args.cache_dir,
-        "revision": model_args.model_revision,
-        "use_auth_token": True if model_args.use_auth_token else None,
-    }
-    if model_args.config_name:
-        config = AutoConfig.from_pretrained(model_args.config_name, **config_kwargs)
-    elif model_args.model_name_or_path:
-        config = AutoConfig.from_pretrained(model_args.model_name_or_path, **config_kwargs)
-    else:
-        config = CONFIG_MAPPING[model_args.model_type]()
-        logger.warning("You are instantiating a new config instance from scratch.")
+def main(args: Args):
+    logging.set_verbosity_error()
+    set_seed(args.seed)
+    args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    tokenizer_kwargs = {
-        "cache_dir": model_args.cache_dir,
-        "use_fast": model_args.use_fast_tokenizer,
-        "revision": model_args.model_revision,
-        "use_auth_token": True if model_args.use_auth_token else None,
-    }
-    if model_args.tokenizer_name:
-        tokenizer = AutoTokenizer.from_pretrained(model_args.tokenizer_name, **tokenizer_kwargs)
-    elif model_args.model_name_or_path:
-        tokenizer = AutoTokenizer.from_pretrained(model_args.model_name_or_path, **tokenizer_kwargs)
-    else:
-        raise ValueError(
-            "You are instantiating a new tokenizer from scratch. This is not supported by this script."
-            "You can do it from another script, save it, and load it from here, using --tokenizer_name."
-        )
+    tokenizer: PreTrainedTokenizer = AutoTokenizer.from_pretrained(args.model_name)
+    model: SimCSEModel = SimCSEModel(args.model_name).to(args.device)
 
-    if model_args.model_name_or_path:
-        if 'roberta' in model_args.model_name_or_path:
-            model = RobertaForCL.from_pretrained(
-                model_args.model_name_or_path,
-                from_tf=bool(".ckpt" in model_args.model_name_or_path),
-                config=config,
-                cache_dir=model_args.cache_dir,
-                revision=model_args.model_revision,
-                use_auth_token=True if model_args.use_auth_token else None,
-                model_args=model_args                  
-            )
-        elif 'bert' in model_args.model_name_or_path:
-            model = BertForCL.from_pretrained(
-                model_args.model_name_or_path,
-                from_tf=bool(".ckpt" in model_args.model_name_or_path),
-                config=config,
-                cache_dir=model_args.cache_dir,
-                revision=model_args.model_revision,
-                use_auth_token=True if model_args.use_auth_token else None,
-                model_args=model_args
-            )
-            if model_args.do_mlm:
-                pretrained_model = BertForPreTraining.from_pretrained(model_args.model_name_or_path)
-                model.lm_head.load_state_dict(pretrained_model.cls.predictions.state_dict())
-        else:
-            raise NotImplementedError
-    else:
-        raise NotImplementedError
-        logger.info("Training new model from scratch")
-        model = AutoModelForMaskedLM.from_config(config)
+    train_dataset = SimCSEDataset(args.dataset_dir / "train.txt")
 
-    model.resize_token_embeddings(len(tokenizer))
-
-    # Prepare features
-    column_names = datasets["train"].column_names
-    sent2_cname = None
-    if len(column_names) == 2:
-        # Pair datasets
-        sent0_cname = column_names[0]
-        sent1_cname = column_names[1]
-    elif len(column_names) == 3:
-        # Pair datasets with hard negatives
-        sent0_cname = column_names[0]
-        sent1_cname = column_names[1]
-        sent2_cname = column_names[2]
-    elif len(column_names) == 1:
-        # Unsupervised datasets
-        sent0_cname = column_names[0]
-        sent1_cname = column_names[0]
-    else:
-        raise NotImplementedError
-
-    def prepare_features(examples):
-        # padding = longest (default)
-        #   If no sentence in the batch exceed the max length, then use
-        #   the max sentence length in the batch, otherwise use the 
-        #   max sentence length in the argument and truncate those that
-        #   exceed the max length.
-        # padding = max_length (when pad_to_max_length, for pressure test)
-        #   All sentences are padded/truncated to data_args.max_seq_length.
-        total = len(examples[sent0_cname])
-
-        # Avoid "None" fields 
-        for idx in range(total):
-            if examples[sent0_cname][idx] is None:
-                examples[sent0_cname][idx] = " "
-            if examples[sent1_cname][idx] is None:
-                examples[sent1_cname][idx] = " "
-        
-        sentences = examples[sent0_cname] + examples[sent1_cname]
-
-        # If hard negative exists
-        if sent2_cname is not None:
-            for idx in range(total):
-                if examples[sent2_cname][idx] is None:
-                    examples[sent2_cname][idx] = " "
-            sentences += examples[sent2_cname]
-
-        sent_features = tokenizer(
-            sentences,
-            max_length=data_args.max_seq_length,
+    # `collate_fn` is for processing the list of samples to form a batch
+    # see: https://discuss.pytorch.org/t/how-to-use-collate-fn/27181
+    def collate_fn(batch: List[str]) -> BatchEncoding:
+        return tokenizer(
+            batch,
+            padding=True,
             truncation=True,
-            padding="max_length" if data_args.pad_to_max_length else False,
+            return_tensors="pt",
+            max_length=args.max_seq_len,
         )
 
-        features = {}
-        if sent2_cname is not None:
-            for key in sent_features:
-                features[key] = [[sent_features[key][i], sent_features[key][i+total], sent_features[key][i+total*2]] for i in range(total)]
-        else:
-            for key in sent_features:
-                features[key] = [[sent_features[key][i], sent_features[key][i+total]] for i in range(total)]
-            
-        return features
+    # see: https://pytorch.org/docs/stable/data.html
+    #      https://pytorch.org/tutorials/beginner/basics/data_tutorial.html
+    train_dataloader = DataLoader(
+        train_dataset,
+        collate_fn=collate_fn,
+        batch_size=args.batch_size,
+        shuffle=True,
+        # num_workers and pin_memory are for speeding up training
+        num_workers=4,
+        pin_memory=True,
+        # batch_size varies in the last batch because
+        # the last batch size will be the number of remaining samples (i.e. len(train_dataloader) % batch_size)
+        # to avoid unstablity of contrastive learning, we drop the last batch
+        drop_last=True,
+    )
 
-    if training_args.do_train:
-        train_dataset = datasets["train"].map(
-            prepare_features,
-            batched=True,
-            num_proc=data_args.preprocessing_num_workers,
-            remove_columns=column_names,
-            load_from_cache_file=not data_args.overwrite_cache,
-        )
+    # FYI: huggingface/transformers' AdamW implementation is deprecated and you should use PyTorch's AdamW instead.
+    # see: https://github.com/huggingface/transformers/issues/3407
+    #      https://github.com/huggingface/transformers/issues/18757
+    optimizer = torch.optim.AdamW(params=model.parameters(), lr=args.lr)
 
-    # Data collator
-    @dataclass
-    class OurDataCollatorWithPadding:
+    # reference implementation uses a linear scheduler with warmup, which is a default scheduler of transformers' Trainer
+    # with num_training_steps = 0 (i.e. no warmup)
+    lr_scheduler = get_linear_schedule_with_warmup(
+        optimizer=optimizer,
+        num_warmup_steps=args.num_warmup_steps,
+        # len(train_dataloader) is the number of steps in one epoch
+        num_training_steps=len(train_dataloader) * args.epochs,
+    )
 
-        tokenizer: PreTrainedTokenizerBase
-        padding: Union[bool, str, PaddingStrategy] = True
-        max_length: Optional[int] = None
-        pad_to_multiple_of: Optional[int] = None
-        mlm: bool = True
-        mlm_probability: float = data_args.mlm_probability
+    # evaluation class for STS task
+    # we use a simple cosine similarity as a semantic similarity
+    # and use Spearman's correlation as an evaluation metric
+    # see: `sts.py`
+    sts = STSEvaluation(sts_dir=args.sts_dir)
 
-        def __call__(self, features: List[Dict[str, Union[List[int], List[List[int]], torch.Tensor]]]) -> Dict[str, torch.Tensor]:
-            special_keys = ['input_ids', 'attention_mask', 'token_type_ids', 'mlm_input_ids', 'mlm_labels']
-            bs = len(features)
-            if bs > 0:
-                num_sent = len(features[0]['input_ids'])
-            else:
-                return
-            flat_features = []
-            for feature in features:
-                for i in range(num_sent):
-                    flat_features.append({k: feature[k][i] if k in special_keys else feature[k] for k in feature})
-
-            batch = self.tokenizer.pad(
-                flat_features,
-                padding=self.padding,
-                max_length=self.max_length,
-                pad_to_multiple_of=self.pad_to_multiple_of,
+    # encode sentences (List[str]) and output embeddings (Tensor)
+    # this is for evaluation
+    @torch.inference_mode()
+    def encode(texts: List[str]) -> torch.Tensor:
+        embs = []
+        model.eval()
+        for text in chunked(texts, args.batch_size * 8):
+            batch: BatchEncoding = tokenizer(
+                text,
+                padding=True,
+                truncation=True,
                 return_tensors="pt",
             )
-            if model_args.do_mlm:
-                batch["mlm_input_ids"], batch["mlm_labels"] = self.mask_tokens(batch["input_ids"])
+            # SimCSE uses MLP layer only during training
+            # in this implementation, we use `model.training` to switch between training and evaluation
+            emb = model(**batch.to(args.device))
+            embs.append(emb.cpu())
+        # shape of output: (len(texts), hidden_size)
+        return torch.cat(embs, dim=0)
 
-            batch = {k: batch[k].view(bs, num_sent, -1) if k in special_keys else batch[k].view(bs, num_sent, -1)[:, 0] for k in batch}
+    # evaluation before training
+    model.eval()
+    best_stsb = sts.dev(encode=encode)
+    best_step = 0
 
-            if "label" in batch:
-                batch["labels"] = batch["label"]
-                del batch["label"]
-            if "label_ids" in batch:
-                batch["labels"] = batch["label_ids"]
-                del batch["label_ids"]
+    # evaluate the model and store metrics before training
+    # this is important to check the appropriateness of training procedure
+    print(f"epoch: {0:>3} |\tstep: {0:>6} |\tloss: {' '*9}nan |\tSTSB: {best_stsb:.4f}")
+    logs: List[Dict[str, Union[int, float]]] = [
+        {
+            "epoch": 0,
+            "step": best_step,
+            "loss": None,
+            "stsb": best_stsb,
+        }
+    ]
 
-            return batch
-        
-        def mask_tokens(
-            self, inputs: torch.Tensor, special_tokens_mask: Optional[torch.Tensor] = None
-        ) -> Tuple[torch.Tensor, torch.Tensor]:
-            """
-            Prepare masked tokens inputs/labels for masked language modeling: 80% MASK, 10% random, 10% original.
-            """
-            inputs = inputs.clone()
-            labels = inputs.clone()
-            # We sample a few tokens in each sequence for MLM training (with probability `self.mlm_probability`)
-            probability_matrix = torch.full(labels.shape, self.mlm_probability)
-            if special_tokens_mask is None:
-                special_tokens_mask = [
-                    self.tokenizer.get_special_tokens_mask(val, already_has_special_tokens=True) for val in labels.tolist()
-                ]
-                special_tokens_mask = torch.tensor(special_tokens_mask, dtype=torch.bool)
-            else:
-                special_tokens_mask = special_tokens_mask.bool()
+    # finally, start training!
+    for epoch in range(args.epochs):
+        model.train()
 
-            probability_matrix.masked_fill_(special_tokens_mask, value=0.0)
-            masked_indices = torch.bernoulli(probability_matrix).bool()
-            labels[~masked_indices] = -100  # We only compute loss on masked tokens
+        # tqdm makes it easy to visualize how well the training is progressing
+        for step, batch in tqdm(
+            enumerate(train_dataloader),
+            total=len(train_dataloader),
+            dynamic_ncols=True,
+        ):
+            # transfer batch to the device
+            batch: BatchEncoding = batch.to(args.device)
+            # if you want to see the actual data, please uncomment the following line.
+            # print(batch)
+            # and also, if you want to see the actual input strings, please uncomment the following line.
+            # print(tokenizer.batch_decode(batch.input_ids, skip_special_tokens=True))
 
-            # 80% of the time, we replace masked input tokens with tokenizer.mask_token ([MASK])
-            indices_replaced = torch.bernoulli(torch.full(labels.shape, 0.8)).bool() & masked_indices
-            inputs[indices_replaced] = self.tokenizer.convert_tokens_to_ids(self.tokenizer.mask_token)
+            # simply forward inputs twice!
+            # different dropout masks are adapt automatically
+            emb1 = model.forward(**batch)
+            emb2 = model.forward(**batch)
 
-            # 10% of the time, we replace masked input tokens with random word
-            indices_random = torch.bernoulli(torch.full(labels.shape, 0.5)).bool() & masked_indices & ~indices_replaced
-            random_words = torch.randint(len(self.tokenizer), labels.shape, dtype=torch.long)
-            inputs[indices_random] = random_words[indices_random]
+            # SimCSE training objective:
+            #    maximize the similarity between the same sentence
+            # => make diagonal elements most similar
 
-            # The rest of the time (10% of the time) we keep the masked input tokens unchanged
-            return inputs, labels
+            # shape of sim_matrix: (batch_size, batch_size)
+            # calculate cosine similarity between all pair of embeddings (n x n)
+            sim_matrix = F.cosine_similarity(emb1.unsqueeze(1), emb2.unsqueeze(0), dim=-1)
+            # FYI: SimCSE is sensitive for the temperature parameter.
+            # see Table D.1 of the paper
+            sim_matrix = sim_matrix / args.temperature
 
-    data_collator = default_data_collator if data_args.pad_to_max_length else OurDataCollatorWithPadding(tokenizer)
+            # labels := [0, 1, 2, ..., batch_size - 1]
+            # labels indicate the index of the diagonal element (i.e. positive examples)
+            labels = torch.arange(args.batch_size).long().to(args.device)
+            # it may seem strange to use Cross-Entropy Loss here.
+            # this is a shorthund of doing SoftMax and maximizing the similarity of diagonal elements
+            loss = F.cross_entropy(sim_matrix, labels)
 
-    trainer = CLTrainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_dataset if training_args.do_train else None,
-        tokenizer=tokenizer,
-        data_collator=data_collator,
-    )
-    trainer.model_args = model_args
+            optimizer.zero_grad()
+            loss.backward()
 
-    # Training
-    if training_args.do_train:
-        model_path = (
-            model_args.model_name_or_path
-            if (model_args.model_name_or_path is not None and os.path.isdir(model_args.model_name_or_path))
-            else None
-        )
-        train_result = trainer.train(model_path=model_path)
-        trainer.save_model()  # Saves the tokenizer too for easy upload
+            optimizer.step()
+            lr_scheduler.step()
 
-        output_train_file = os.path.join(training_args.output_dir, "train_results.txt")
-        if trainer.is_world_process_zero():
-            with open(output_train_file, "w") as writer:
-                logger.info("***** Train results *****")
-                for key, value in sorted(train_result.metrics.items()):
-                    logger.info(f"  {key} = {value}")
-                    writer.write(f"{key} = {value}\n")
+            # for every `args.eval_logging_interval` steps, perform evaluation on STS task and print logs
+            if (step + 1) % args.eval_logging_interval == 0 or (step + 1) == len(train_dataloader):
+                model.eval()
+                # evaluate on the STS-B development set
+                stsb_score = sts.dev(encode=encode)
 
-            # Need to save the state, since Trainer.save_model saves only the tokenizer with the model
-            trainer.state.save_to_json(os.path.join(training_args.output_dir, "trainer_state.json"))
+                # you should use the best model for the evaluation to avoid using overfitted model
+                # FYI: https://github.com/princeton-nlp/SimCSE/issues/62
+                if best_stsb < stsb_score:
+                    best_stsb = stsb_score
+                    best_step = step + 1
+                    # only save the best performing model
+                    torch.save(model.state_dict(), args.output_dir / "model.pt")
 
-    # Evaluation
-    results = {}
-    if training_args.do_eval:
-        logger.info("*** Evaluate ***")
-        results = trainer.evaluate(eval_senteval_transfer=True)
+                # use `tqdm.write` instead of `print` to prevent terminal display corruption
+                tqdm.write(
+                    f"epoch: {epoch:>3} |\tstep: {step+1:>6} |\tloss: {loss.item():.10f} |\tSTSB: {stsb_score:.4f}"
+                )
+                logs.append(
+                    {
+                        "epoch": epoch,
+                        "step": step + 1,
+                        "loss": loss.item(),
+                        "stsb": stsb_score,
+                    }
+                )
+                pd.DataFrame(logs).to_csv(args.output_dir / "logs.csv", index=False)
 
-        output_eval_file = os.path.join(training_args.output_dir, "eval_results.txt")
-        if trainer.is_world_process_zero():
-            with open(output_eval_file, "w") as writer:
-                logger.info("***** Eval results *****")
-                for key, value in sorted(results.items()):
-                    logger.info(f"  {key} = {value}")
-                    writer.write(f"{key} = {value}\n")
+                # if you want to see the changes of similarity matrix, uncomment the following line
+                # tqdm.write(str(sim_matrix))
+                model.train()
 
-    return results
+    # save epochs, steps, losses, and STSB dev scores
+    with (args.output_dir / "dev-metrics.json").open("w") as f:
+        data = {
+            "best-step": best_step,
+            "best-stsb": best_stsb,
+        }
+        json.dump(data, f, indent=2, ensure_ascii=False)
 
-def _mp_fn(index):
-    # For xla_spawn (TPUs)
-    main()
+    # load the best model for final evaluation
+    if (args.output_dir / "model.pt").exists():
+        model.load_state_dict(torch.load(args.output_dir / "model.pt"))
+    model.eval().to(args.device)
+
+    sts_metrics = sts(encode=encode)
+    with (args.output_dir / "sts-metrics.json").open("w") as f:
+        json.dump(sts_metrics, f, indent=2, ensure_ascii=False)
+
+    with (args.output_dir / "config.json").open("w") as f:
+        data = {k: v if type(v) in [int, float] else str(v) for k, v in vars(args).items()}
+        json.dump(data, f, indent=2, ensure_ascii=False)
 
 
 if __name__ == "__main__":
-    main()
+    args = Args.from_args()
+    main(args)
