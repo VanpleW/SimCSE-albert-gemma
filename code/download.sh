@@ -1,4 +1,4 @@
-# download STS datasets and original training datasets in parallel
+# download STS datasets and wiki1m dataset in parallel
 
 mkdir -p ./datasets/sts
 
@@ -51,15 +51,7 @@ function sick() {
     rm sick_test_annotated.zip
 }
 
-# https://github.com/princeton-nlp/SimCSE/blob/30b08875a39d0e89d71f17c57bd0dcc18e7c2f15/data/download_nli.sh
-function sup_simcse() {
-    mkdir -p ./datasets/sup-simcse
-    wget https://huggingface.co/datasets/princeton-nlp/datasets-for-simcse/resolve/main/nli_for_simcse.csv
-    mv ./nli_for_simcse.csv ./datasets/sup-simcse/train.csv
-}
-
 # https://github.com/princeton-nlp/SimCSE/blob/30b08875a39d0e89d71f17c57bd0dcc18e7c2f15/data/download_wiki.sh
-# see: `Training details` in Sec. 6.1
 function unsup_simcse() {
     mkdir -p ./datasets/unsup-simcse
     wget https://huggingface.co/datasets/princeton-nlp/datasets-for-simcse/resolve/main/wiki1m_for_simcse.txt

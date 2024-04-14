@@ -1,5 +1,8 @@
-# original configurations described in the paper are used
-# see: Table A.1 of Appendix.A
+"""
+    Due to limited computational resources, 
+    only one set of training parameter is used for each model,
+    that might lead to non-ideal results for some models
+"""
 
 
 function bert-base-uncased() {
@@ -44,7 +47,7 @@ function albert-base-v2() {
         --output_dir ./outputs/albert-base-v2
 }
 
-function llama() {
+function llama2-7B() {
     poetry run python train.py \
         --model_name llama \
         --batch_size 64 \
@@ -52,7 +55,7 @@ function llama() {
         --output_dir ./outputs/llama
 }
 
-function gemma() {
+function gemma-7B() {
     poetry run python train.py \
         --model_name gemma \
         --batch_size 64 \
@@ -60,6 +63,5 @@ function gemma() {
         --output_dir ./outputs/gemma
 }
 
-# run training!
-# you should change the function name to run different models
+# call for training starts
 bert-base-uncased

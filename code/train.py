@@ -1,8 +1,6 @@
-# paper: https://aclanthology.org/2021.emnlp-main.552/
 # reference implementation: https://github.com/princeton-nlp/SimCSE
 #
 # this implementation only supports Unsup-SimCSE.
-# if you want to run the training of Sup-SimCSE, please modify this code yourself.
 
 import json
 import os
@@ -32,69 +30,41 @@ from sts import STSEvaluation
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
-# classopt is a library for parsing command line arguments in a dataclass style.
-# different from argparse, classopt can enjoy the benefits of type hints.
-# see: https://github.com/moisutsu/classopt (let's star it!)
 @classopt(default_long=True)
 class Args:
     model_name: str = "bert-base-uncased"
-    # any data set in line-by-line text format can be used.
-    # however, it is worth noting that diversity of the dataset is important for SimCSE.
-    # see: https://github.com/princeton-nlp/SimCSE/issues/62
     dataset_dir: Path = "./datasets/unsup-simcse"
     sts_dir: Path = "./datasets/sts"
     output_dir: Path = "./outputs"
 
-    # for more detailed hyperparameter settings, see Appendix.A of the paper
-    # FYI: SimCSE is not sensitive to batch sizes and learning rates
+    # SimCSE is not sensitive to batch sizes and learning rates
     batch_size: int = 64
-    # the number of epochs is 1 for Unsup-SimCSE, and 3 for Sup-SimCSE in the paper
     epochs: int = 1
     lr: float = 3e-5
-    # num_warmup_steps is 0 by default (i.e. no warmup)
     num_warmup_steps: int = 0
 
     # see Table D.1 of the paper
     temperature: float = 0.05
 
-    # FYI: max_seq_len of reference implementation is 32
-    # it seems short, but it is enough for the STS task
-    # you should be careful when you apply SimCSE to other tasks that require longer sequences to be handled properly.
-    # for other hyperparameters, see Appendix.A of the paper.
     max_seq_len: int = 32
 
-    # FYI: the paper says that the evaluation interval is 250 steps.
-    # however, the example training script of official implementation uses 125 steps.
-    # this does not seem to be a problem when the number of training steps is large (i.e. batch size is small), as in BERT (batch_size=64),
-    # but it may make some difference when the number of steps is small (i.e. batch size is large), as in RoBERTa (batch_size=512).
-    # see: https://github.com/princeton-nlp/SimCSE/blob/511c99d4679439c582beb86a0372c04865610b6b/run_unsup_example.sh
     eval_logging_interval: int = 250
 
-    # if you want to use `fp16`, you may encounter some issues.
-    # see: https://github.com/princeton-nlp/SimCSE/issues/38#issuecomment-855457923
     device: str = "cuda:0"
 
-    # due to various influences such as implementation and hardware, the same random seed does not always produce the same results.
-    # the hyperparameters used in the paper are tuned with a single random seed,
-    # so the results may be slightly different from the paper.
-    # if you train your own model, you should preferably re-tune the hyperparameters.
-    # FYI: https://github.com/princeton-nlp/SimCSE/issues/63
+    # random seed may affect the hyperparameter tuning
     seed: int = 42
 
 
-# Reading text line by line is a very simple processing, so we don't need to use a Dataset class actually.
-# However we define a dedicated class for future extensibility.
 @dataclass
 class SimCSEDataset(Dataset):
     path: Path
     data: List[str] = None
 
-    # For simplicity, this dataset class is designed to tokenize text for each loop,
-    # but if performance is more important, you should tokenize all text in advance.
     def __post_init__(self):
         self.data = []
         with self.path.open() as f:
-            # to prevent whole text into memory at once
+            # to prevent memory exceeded
             for line in f:
                 line = line.strip()
                 if line:
@@ -110,12 +80,9 @@ class SimCSEDataset(Dataset):
 class SimCSEModel(nn.Module):
     def __init__(self, model_name: str):
         super().__init__()
-        # you can use any models
         self.backbone: PreTrainedModel = AutoModel.from_pretrained(model_name)
 
-        # define additional MLP layer
-        # see Section 6.3 of the paper for more details
-        # refenrece: https://github.com/princeton-nlp/SimCSE/blob/511c99d4679439c582beb86a0372c04865610b6b/simcse/models.py#L19
+        # additional MLP layer
         self.hidden_size: int = self.backbone.config.hidden_size
         self.dense = nn.Linear(self.hidden_size, self.hidden_size)
         self.activation = nn.Tanh()
@@ -124,7 +91,7 @@ class SimCSEModel(nn.Module):
         self,
         input_ids: Tensor,
         attention_mask: Tensor = None,
-        # RoBERTa variants don't have token_type_ids, so this argument is optional
+        # optinal since RoBERTa variants don't have token_type_ids
         token_type_ids: Tensor = None,
     ) -> Tensor:
         # shape of input_ids: (batch_size, seq_len)
@@ -136,8 +103,7 @@ class SimCSEModel(nn.Module):
         )
 
         # take representations of [CLS] token
-        # we only implement the best performing pooling, [CLS], for simplicity
-        # you can easily extend to other poolings (such as mean pooling or max pooling) by edting this line
+        # implement the best performing pooling, [CLS], for simplicity
         # shape of last_hidden_state: (batch_size, seq_len, hidden_size)
         emb = outputs.last_hidden_state[:, 0]
 
@@ -169,7 +135,7 @@ def main(args: Args):
     train_dataset = SimCSEDataset(args.dataset_dir / "train.txt")
 
     # `collate_fn` is for processing the list of samples to form a batch
-    # see: https://discuss.pytorch.org/t/how-to-use-collate-fn/27181
+    # ref: https://discuss.pytorch.org/t/how-to-use-collate-fn/27181
     def collate_fn(batch: List[str]) -> BatchEncoding:
         return tokenizer(
             batch,
@@ -179,25 +145,20 @@ def main(args: Args):
             max_length=args.max_seq_len,
         )
 
-    # see: https://pytorch.org/docs/stable/data.html
-    #      https://pytorch.org/tutorials/beginner/basics/data_tutorial.html
+
     train_dataloader = DataLoader(
         train_dataset,
         collate_fn=collate_fn,
         batch_size=args.batch_size,
         shuffle=True,
-        # num_workers and pin_memory are for speeding up training
         num_workers=4,
         pin_memory=True,
-        # batch_size varies in the last batch because
-        # the last batch size will be the number of remaining samples (i.e. len(train_dataloader) % batch_size)
-        # to avoid unstablity of contrastive learning, we drop the last batch
+        # drop the last batch for stability
         drop_last=True,
     )
 
-    # FYI: huggingface/transformers' AdamW implementation is deprecated and you should use PyTorch's AdamW instead.
-    # see: https://github.com/huggingface/transformers/issues/3407
-    #      https://github.com/huggingface/transformers/issues/18757
+    # replace AdamW from huggingface to PyTorch's AdamW instead.
+    # the huggingface one does not work
     optimizer = torch.optim.AdamW(params=model.parameters(), lr=args.lr)
 
     # reference implementation uses a linear scheduler with warmup, which is a default scheduler of transformers' Trainer
@@ -212,7 +173,6 @@ def main(args: Args):
     # evaluation class for STS task
     # we use a simple cosine similarity as a semantic similarity
     # and use Spearman's correlation as an evaluation metric
-    # see: `sts.py`
     sts = STSEvaluation(sts_dir=args.sts_dir)
 
     # encode sentences (List[str]) and output embeddings (Tensor)
@@ -264,32 +224,18 @@ def main(args: Args):
         ):
             # transfer batch to the device
             batch: BatchEncoding = batch.to(args.device)
-            # if you want to see the actual data, please uncomment the following line.
-            # print(batch)
-            # and also, if you want to see the actual input strings, please uncomment the following line.
-            # print(tokenizer.batch_decode(batch.input_ids, skip_special_tokens=True))
-
-            # simply forward inputs twice!
-            # different dropout masks are adapt automatically
+            # double forward with different dropout noise to get positive pairs
             emb1 = model.forward(**batch)
             emb2 = model.forward(**batch)
-
-            # SimCSE training objective:
-            #    maximize the similarity between the same sentence
-            # => make diagonal elements most similar
 
             # shape of sim_matrix: (batch_size, batch_size)
             # calculate cosine similarity between all pair of embeddings (n x n)
             sim_matrix = F.cosine_similarity(emb1.unsqueeze(1), emb2.unsqueeze(0), dim=-1)
-            # FYI: SimCSE is sensitive for the temperature parameter.
-            # see Table D.1 of the paper
             sim_matrix = sim_matrix / args.temperature
 
             # labels := [0, 1, 2, ..., batch_size - 1]
             # labels indicate the index of the diagonal element (i.e. positive examples)
             labels = torch.arange(args.batch_size).long().to(args.device)
-            # it may seem strange to use Cross-Entropy Loss here.
-            # this is a shorthund of doing SoftMax and maximizing the similarity of diagonal elements
             loss = F.cross_entropy(sim_matrix, labels)
 
             optimizer.zero_grad()
@@ -301,11 +247,8 @@ def main(args: Args):
             # for every `args.eval_logging_interval` steps, perform evaluation on STS task and print logs
             if (step + 1) % args.eval_logging_interval == 0 or (step + 1) == len(train_dataloader):
                 model.eval()
-                # evaluate on the STS-B development set
                 stsb_score = sts.dev(encode=encode)
 
-                # you should use the best model for the evaluation to avoid using overfitted model
-                # FYI: https://github.com/princeton-nlp/SimCSE/issues/62
                 if best_stsb < stsb_score:
                     best_stsb = stsb_score
                     best_step = step + 1
@@ -325,9 +268,6 @@ def main(args: Args):
                     }
                 )
                 pd.DataFrame(logs).to_csv(args.output_dir / "logs.csv", index=False)
-
-                # if you want to see the changes of similarity matrix, uncomment the following line
-                # tqdm.write(str(sim_matrix))
                 model.train()
 
     # save epochs, steps, losses, and STSB dev scores
